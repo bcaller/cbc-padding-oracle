@@ -1,34 +1,19 @@
-# CBC padding oracle attack to decrypt all but the first block
-from Crypto.Cipher import DES3
-from Crypto.Util.Padding import pad, unpad
+import logging
 
-BLOCK_SIZE = 8
-KEY = b'abcdefghijklmnopqrstuvwx'
-IV = b'abcdefgh'
-PLAINTEXT = b'Sir, flag{this_is_the_secret_flag} is the flag you are looking for'
-
-
-def encrypt(bs):
-    cipher = DES3.new(KEY, DES3.MODE_CBC, iv=IV)
-    return cipher.encrypt(pad(bs, BLOCK_SIZE))
-
-
-def decrypt(bs):
-    cipher = DES3.new(KEY, DES3.MODE_CBC, iv=IV)
-    return unpad(cipher.decrypt(bs), BLOCK_SIZE)
-
+log = logging.getLogger(__name__)
 
 
 class PaddingOracle:
+    """CBC padding oracle to decrypt all but the first block."""
     def __init__(self, block_size: int) -> None:
         self._block_size = block_size
         self._tries = 0
 
     def has_correct_padding(self, ciphertext: bytes) -> bool:
         self._tries += 1
-        return self._oracle(ciphertext)
+        return self._oracle_says_padding_correct(ciphertext)
 
-    def _oracle(self, ciphertext: bytes) -> bool:
+    def _oracle_says_padding_correct(self, ciphertext: bytes) -> bool:
         """Call the oracle and return True if and only if the padding is correct.
 
         This should e.g. call a remote server and check the error code or decryption timing.
@@ -41,25 +26,8 @@ class PaddingOracle:
         return self._tries
 
 
-class TripleDESDecryptionPaddingOracle(PaddingOracle):
-    def __init__(self, block_size: int, iv: bytes, key: bytes) -> None:
-        self._iv = iv
-        self._key = key
-        super().__init__(block_size)
-
-    # Of course, this oracle is silly since we have the key and iv, but we just use it to determine if the
-    # padding is correct or not
-    def _oracle(self, ciphertext: bytes) -> bool:
-        try:
-            cipher = DES3.new(self._key, DES3.MODE_CBC, iv=self._iv)
-            unpad(cipher.decrypt(ciphertext), BLOCK_SIZE)
-            return True
-        except ValueError:
-            return False
-
-
 class Blocks:
-    def __init__(self, data, block_size=BLOCK_SIZE):
+    def __init__(self, data, block_size):
         self.data = data
         self.block_size = block_size
 
@@ -83,40 +51,46 @@ class Blocks:
     def __len__(self) -> int:
         return len(self.data) // self.block_size
 
-
-def attack(ciphertext: bytes, oracle: PaddingOracle) -> bytes:
-    block_size = BLOCK_SIZE
-    cipherblocks = Blocks(ciphertext)
-    for i in range(block_size):
-        previous_block = bytearray(cipherblocks[-2])
-        previous_block[i] = (previous_block[i] + 1) % 256
-        last_block = cipherblocks[-1]
-        test = bytes(previous_block) + last_block
+def find_padding_length(oracle: PaddingOracle, cipherblocks: Blocks):
+    last_block = cipherblocks[-1]
+    for i in range(cipherblocks.block_size):
+        block_before_last = bytearray(cipherblocks[-2])
+        block_before_last[i] = (block_before_last[i] + 1) % 256
+        test = bytes(block_before_last) + last_block
         if not oracle.has_correct_padding(test):
-            padding_length = block_size - i
-            break
+            return cipherblocks.block_size - i
     else:
         raise Exception("Couldn't find padding")
-    print("Padding length:", padding_length)
-    known_plaintext = bytearray([padding_length] * padding_length)
-    # We know how the last block ends, let's decrypt the whole last block
-    known_plaintext = decrypt_final_block(oracle, cipherblocks, known_plaintext)
-    del cipherblocks[-1]
-    while len(cipherblocks) > 1:
-        known_plaintext = decrypt_final_block(oracle, cipherblocks) + known_plaintext
-        print(
-            "\nDecrypted",
-            len(known_plaintext),
-            "bytes out of",
-            len(ciphertext),
-            "after calling the oracle",
-            oracle.tries,
-            "times",
-        )
-        print(f"'{known_plaintext.decode('utf-8')}'")
-        del cipherblocks[-1]
 
-    return known_plaintext
+
+def attack(ciphertext: bytes, oracle: PaddingOracle, block_size: int) -> bytes:
+    assert len(ciphertext) % block_size == 0, "Ciphertext length not a multiple of expected block size"
+    try:
+        cipherblocks = Blocks(ciphertext, block_size)
+        padding_length = find_padding_length(oracle, cipherblocks)
+        log.info("Padding length: %d", padding_length)
+        known_plaintext = bytearray([padding_length] * padding_length)
+        # We know how the last block ends, let's decrypt the whole last block
+        known_plaintext = decrypt_final_block(oracle, cipherblocks, known_plaintext)
+        del cipherblocks[-1]
+        while len(cipherblocks) > 1:
+            known_plaintext = decrypt_final_block(oracle, cipherblocks) + known_plaintext
+            log.info(
+                "Decrypted %d bytes out of %d after calling the oracle %d times",
+                len(known_plaintext),
+                len(ciphertext),
+                oracle.tries,
+            )
+            try:
+                log.info("'%s'", known_plaintext.decode('utf-8'))
+            except UnicodeDecodeError:
+                log.info("'%s'", known_plaintext)
+            del cipherblocks[-1]
+
+        return known_plaintext
+    except:
+        log.error("Failed after calling oracle %d times", oracle.tries)
+        raise
 
 
 def decrypt_final_block(oracle: PaddingOracle, cipherblocks: Blocks, known_block_end: bytes=None) -> bytes:
@@ -141,15 +115,3 @@ def decrypt_final_block(oracle: PaddingOracle, cipherblocks: Blocks, known_block
         else:
             raise Exception("Couldn't decrypt last block")
     return new_known_plaintext
-
-
-def run():
-    oracle = TripleDESDecryptionPaddingOracle(BLOCK_SIZE, IV, KEY)
-    encrypted_msg = encrypt(PLAINTEXT)
-    print("Encrypted message:", encrypted_msg.hex())
-    print("Recovering plaintext")
-    attack(encrypted_msg, oracle)
-
-
-if __name__ == "__main__":
-    run()
